@@ -322,6 +322,58 @@ def load_dataset(data_root="data", max_train_pos=None, max_train_neg=None,
     return train_pos, train_neg, test_pos, test_neg
 
 
+def load_challenging_dataset(data_root="data/dataset"):
+    """
+    Load the pre-generated challenging dataset.
+    
+    Expected structure:
+        data/dataset/
+        ├── original_pos/           # Clean positive patches (train)
+        ├── original_neg/           # Clean negative patches (train)
+        ├── challenging_pos/        # Degraded positive patches (train)
+        ├── challenging_neg/        # Degraded negative patches (train)
+        ├── test_original_pos/      # Clean positive patches (test)
+        ├── test_original_neg/      # Clean negative patches (test)
+        ├── test_challenging_pos/   # Degraded positive patches (test)
+        └── test_challenging_neg/   # Degraded negative patches (test)
+    
+    Returns:
+        dict with keys: train_orig_pos, train_orig_neg, train_chal_pos, train_chal_neg,
+                        test_orig_pos, test_orig_neg, test_chal_pos, test_chal_neg
+    """
+    data_root = os.path.abspath(data_root)
+    
+    if not os.path.isdir(data_root):
+        raise FileNotFoundError(
+            f"Dataset directory not found: {data_root}\n"
+            f"Run create_challenging_dataset.py first to generate it."
+        )
+    
+    dirs = {
+        "train_orig_pos": "original_pos",
+        "train_orig_neg": "original_neg",
+        "train_chal_pos": "challenging_pos",
+        "train_chal_neg": "challenging_neg",
+        "test_orig_pos": "test_original_pos",
+        "test_orig_neg": "test_original_neg",
+        "test_chal_pos": "test_challenging_pos",
+        "test_chal_neg": "test_challenging_neg",
+    }
+    
+    dataset = {}
+    for key, dirname in dirs.items():
+        full_path = os.path.join(data_root, dirname)
+        if not os.path.isdir(full_path):
+            raise FileNotFoundError(f"Missing directory: {full_path}")
+        
+        label = key.replace("_", " ").title()
+        images = load_images_from_dir(full_path)
+        dataset[key] = images
+        print(f"  Loaded {len(images):>5d} images from {dirname}")
+    
+    return dataset
+
+
 # ============================================================
 #  Preprocessing functions
 # ============================================================
@@ -352,6 +404,23 @@ def gamma_correction(image, gamma=0.5):
     img_float = image.astype(np.float64) / 255.0
     corrected = np.power(img_float, gamma)
     return (corrected * 255).astype(np.uint8)
+
+
+def apply_bilateral_filter(image, d=9, sigma_color=75, sigma_space=75):
+    """
+    Bilateral filter: removes noise while preserving edges.
+    
+    This is critical for HOG because:
+    - Noise corrupts gradient computation
+    - Standard Gaussian blur removes noise BUT also blurs edges
+    - Bilateral filter removes noise WITHOUT blurring edges
+    
+    Parameters:
+    - d: Diameter of pixel neighborhood (9 is a good balance)
+    - sigma_color: Filter sigma in the color space (higher = more mixing)
+    - sigma_space: Filter sigma in the coordinate space (higher = farther pixels influence)
+    """
+    return cv2.bilateralFilter(image, d, sigma_color, sigma_space)
 
 
 # ============================================================
@@ -520,18 +589,38 @@ def extract_features_scharr_hog(images):
     return np.array(features)
 
 
+def extract_features_bilateral_hog(images):
+    """
+    Improvement 3: Bilateral Filter preprocessing + HOG.
+    Bilateral filter removes noise while preserving edges,
+    which is critical since HOG is edge-based.
+    """
+    features = []
+    for img in tqdm(images, desc="Extracting Bilateral+HOG", leave=False):
+        img = apply_bilateral_filter(img)
+        img = gamma_correction(img, gamma=0.5)
+        feat = extract_hog_opencv(img)
+        features.append(feat)
+    return np.array(features)
+
+
 def extract_features_combined(images):
-    """Improvement 3: CLAHE + Scharr HOG + LBP (all improvements)."""
+    """Improvement 4: CLAHE + Bilateral + Scharr HOG + LBP (all improvements)."""
     features = []
     for img in tqdm(images, desc="Extracting Combined", leave=False):
+        # Step 1: CLAHE for contrast/illumination normalization
         img_clahe = apply_clahe(img)
-        gray = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY)
         
-        # Scharr HOG features
+        # Step 2: Bilateral filter for edge-preserving noise removal
+        img_filtered = apply_bilateral_filter(img_clahe)
+        
+        gray = cv2.cvtColor(img_filtered, cv2.COLOR_BGR2GRAY)
+        
+        # Step 3: Scharr HOG features (better gradient operator)
         hog_feat = extract_hog_scharr(gray)
         
-        # LBP features
-        lbp_feat = extract_lbp_features(img_clahe)
+        # Step 4: LBP features (texture information)
+        lbp_feat = extract_lbp_features(img_filtered)
         
         # Concatenate
         feat = np.concatenate([hog_feat, lbp_feat])
@@ -546,8 +635,9 @@ def extract_features_combined(images):
 METHODS = {
     "Baseline HOG": extract_features_baseline,
     "CLAHE + HOG": extract_features_clahe_hog,
+    "Bilateral + HOG": extract_features_bilateral_hog,
     "Scharr HOG": extract_features_scharr_hog,
-    "Combined (CLAHE+Scharr+LBP)": extract_features_combined,
+    "Combined (CLAHE+Bilateral+Scharr+LBP)": extract_features_combined,
 }
 
 
